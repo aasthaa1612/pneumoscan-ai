@@ -1,0 +1,60 @@
+# -----------------------
+# Python
+# -----------------------
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.db
+*.sqlite3
+
+# Virtual Environment
+venv/
+env/
+ENV/
+
+# -----------------------
+# Node / React
+# -----------------------
+node_modules/
+frontend/node_modules/
+
+# Build folders
+build/
+dist/
+
+# -----------------------
+# Environment files
+# -----------------------
+.env
+.env.*
+
+# -----------------------
+# Model & Outputs
+# -----------------------
+*.pt
+*.h5
+*.pkl
+outputs/
+plots/
+
+# -----------------------
+# Logs
+# -----------------------
+*.log
+
+# -----------------------
+# OS files
+# -----------------------
+.DS_Store
+Thumbs.db
+
+# -----------------------
+# VS Code
+# -----------------------
+.vscode/
+
+# -----------------------
+# Jupyter (if any)
+# -----------------------
+.ipynb_checkpoints/

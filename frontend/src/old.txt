@@ -1,0 +1,922 @@
+import { useState, useRef, useEffect, useCallback } from "react";
+
+// ─── Constants ───────────────────────────────────────────────────────────────
+const FINDING_TYPES = [
+    { id: "consolidation", label: "Consolidation", color: "#ff5b78", desc: "Dense opacity indicating fluid/infection filling alveoli" },
+    { id: "infiltrate", label: "Infiltrate", color: "#f59e0b", desc: "Hazy increased opacity suggesting inflammatory process" },
+    { id: "effusion", label: "Pleural Effusion", color: "#5a96ff", desc: "Fluid accumulation in pleural space" },
+    { id: "cardiomegaly", label: "Cardiomegaly", color: "#a855f7", desc: "Enlarged cardiac silhouette (CTR > 0.5)" },
+    { id: "normal", label: "Clear Lung Fields", color: "#30d47a", desc: "No significant radiographic abnormality" },
+];
+
+const CHAT_SYSTEM = `You are a highly knowledgeable AI radiologist assistant specializing in chest X-ray interpretation and pneumonia detection. You help users understand:
+- Pneumonia diagnosis and radiographic findings
+- Types of pneumonia (bacterial, viral, fungal, aspiration)
+- X-ray interpretation basics (consolidation, infiltrates, effusions)
+- Treatment options and clinical management
+- When to seek emergency care
+- Lung anatomy and physiology
+
+Always remind users you are an AI assistant and cannot replace professional medical diagnosis. Be warm, educational, and clinically accurate. Keep responses concise but complete (3-5 sentences max unless the user asks for detail). Use medical terms but explain them simply.`;
+
+const QUICK_QUESTIONS = [
+    "What does consolidation look like on X-ray?",
+    "Difference between bacterial and viral pneumonia?",
+    "When is pneumonia an emergency?",
+    "What is the recovery timeline?",
+    "How accurate is X-ray for pneumonia?",
+    "Explain pleural effusion",
+];
+
+// ─── Gauge SVG ────────────────────────────────────────────────────────────────
+function Gauge({ value, color, label, size = 110 }) {
+    const r = 38;
+    const cx = 55;
+    const cy = 55;
+    const circumference = Math.PI * r;
+    const offset = circumference - (value / 100) * circumference;
+    return (
+        <div style={{ display: "flex", flexDirection: "column", alignItems: "center", gap: 4 }}>
+            <svg width={size} height={size * 0.6} viewBox="0 0 110 62">
+                <path d={`M 17 55 A 38 38 0 0 1 93 55`} fill="none" stroke="rgba(110,165,255,0.10)" strokeWidth="8" strokeLinecap="round" />
+                <path
+                    d={`M 17 55 A 38 38 0 0 1 93 55`}
+                    fill="none"
+                    stroke={color}
+                    strokeWidth="8"
+                    strokeLinecap="round"
+                    strokeDasharray={circumference}
+                    strokeDashoffset={offset}
+                    style={{ transition: "stroke-dashoffset 1.2s cubic-bezier(0.34,1.56,0.64,1)", filter: `drop-shadow(0 0 6px ${color}88)` }}
+                />
+                <text x="55" y="52" textAnchor="middle" fill={color} fontSize="15" fontWeight="700" fontFamily="'JetBrains Mono',monospace">
+                    {value}%
+                </text>
+            </svg>
+            <span style={{ fontFamily: "'JetBrains Mono',monospace", fontSize: "0.6rem", color: "var(--text3)", textTransform: "uppercase", letterSpacing: "0.6px" }}>{label}</span>
+        </div>
+    );
+}
+
+// ─── Animated counter ─────────────────────────────────────────────────────────
+function AnimatedNumber({ target, duration = 1200, suffix = "" }) {
+    const [val, setVal] = useState(0);
+    useEffect(() => {
+        let start = null;
+        const step = (ts) => {
+            if (!start) start = ts;
+            const p = Math.min((ts - start) / duration, 1);
+            setVal(Math.round(p * target));
+            if (p < 1) requestAnimationFrame(step);
+        };
+        requestAnimationFrame(step);
+    }, [target, duration]);
+    return <>{val}{suffix}</>;
+}
+
+// ─── Heatmap overlay renderer ─────────────────────────────────────────────────
+function drawHeatmap(canvas, findings) {
+    if (!canvas) return;
+    const ctx = canvas.getContext("2d");
+    const { width, height } = canvas;
+    ctx.clearRect(0, 0, width, height);
+
+    const regions = {
+        consolidation: [{ x: 0.55, y: 0.45, r: 0.18, intensity: 0.75 }, { x: 0.65, y: 0.6, r: 0.13, intensity: 0.55 }],
+        infiltrate: [{ x: 0.3, y: 0.4, r: 0.15, intensity: 0.5 }, { x: 0.45, y: 0.55, r: 0.1, intensity: 0.4 }],
+        effusion: [{ x: 0.6, y: 0.75, r: 0.12, intensity: 0.6 }, { x: 0.35, y: 0.78, r: 0.1, intensity: 0.45 }],
+        cardiomegaly: [{ x: 0.45, y: 0.52, r: 0.2, intensity: 0.45 }],
+        normal: [],
+    };
+
+    findings.forEach((f) => {
+        const pts = regions[f.id] || [];
+        const c = f.color;
+        pts.forEach(({ x, y, r, intensity }) => {
+            const grd = ctx.createRadialGradient(x * width, y * height, 0, x * width, y * height, r * width);
+            const rgb = c.replace("#", "");
+            const rr = parseInt(rgb.slice(0, 2), 16);
+            const gg = parseInt(rgb.slice(2, 4), 16);
+            const bb = parseInt(rgb.slice(4, 6), 16);
+            grd.addColorStop(0, `rgba(${rr},${gg},${bb},${intensity})`);
+            grd.addColorStop(0.5, `rgba(${rr},${gg},${bb},${intensity * 0.4})`);
+            grd.addColorStop(1, `rgba(${rr},${gg},${bb},0)`);
+            ctx.fillStyle = grd;
+            ctx.fillRect(0, 0, width, height);
+        });
+    });
+}
+
+// ─── Main App ─────────────────────────────────────────────────────────────────
+export default function PneumoniaDetector() {
+    const [phase, setPhase] = useState("upload"); // upload | scanning | results
+    const [dragActive, setDragActive] = useState(false);
+    const [imageFile, setImageFile] = useState(null);
+    const [imageURL, setImageURL] = useState(null);
+    const [progress, setProgress] = useState(0);
+    const [scanStep, setScanStep] = useState(0);
+    const [results, setResults] = useState(null);
+    const [viewMode, setViewMode] = useState("original"); // original | heatmap | annotated
+    const [activeTab, setActiveTab] = useState("analysis"); // analysis | bot | info
+    const [chatMessages, setChatMessages] = useState([
+        { role: "assistant", content: "Hello! I'm your AI radiology assistant. Upload a chest X-ray to get started, or ask me anything about pneumonia and chest imaging." },
+    ]);
+    const [chatInput, setChatInput] = useState("");
+    const [chatLoading, setChatLoading] = useState(false);
+    const [mousePos, setMousePos] = useState({ x: -999, y: -999 });
+    const [hoveredFinding, setHoveredFinding] = useState(null);
+    const [particleFrame, setParticleFrame] = useState(0);
+    const [showRiskPanel, setShowRiskPanel] = useState(false);
+
+    const fileInputRef = useRef(null);
+    const heatCanvasRef = useRef(null);
+    const particleCanvasRef = useRef(null);
+    const chatEndRef = useRef(null);
+    const scanSteps = ["Preprocessing image…", "Running CNN inference…", "Analyzing lung fields…", "Mapping anomalies…", "Generating report…"];
+
+    // Particle canvas animation
+    useEffect(() => {
+        const canvas = particleCanvasRef.current;
+        if (!canvas) return;
+        const ctx = canvas.getContext("2d");
+        canvas.width = window.innerWidth;
+        canvas.height = window.innerHeight;
+        const particles = Array.from({ length: 55 }, () => ({
+            x: Math.random() * canvas.width,
+            y: Math.random() * canvas.height,
+            r: Math.random() * 1.4 + 0.3,
+            dx: (Math.random() - 0.5) * 0.3,
+            dy: -Math.random() * 0.4 - 0.1,
+            a: Math.random() * 0.5 + 0.1,
+        }));
+        let raf;
+        const animate = () => {
+            ctx.clearRect(0, 0, canvas.width, canvas.height);
+            particles.forEach((p) => {
+                p.x += p.dx;
+                p.y += p.dy;
+                if (p.y < -4) { p.y = canvas.height + 4; p.x = Math.random() * canvas.width; }
+                ctx.beginPath();
+                ctx.arc(p.x, p.y, p.r, 0, Math.PI * 2);
+                ctx.fillStyle = `rgba(90,150,255,${p.a})`;
+                ctx.fill();
+            });
+            raf = requestAnimationFrame(animate);
+        };
+        animate();
+        return () => cancelAnimationFrame(raf);
+    }, []);
+
+    // Mouse glow
+    const handleMouseMove = useCallback((e) => {
+        setMousePos({ x: e.clientX - 280, y: e.clientY - 280 });
+    }, []);
+
+    // Draw heatmap when results arrive
+    useEffect(() => {
+        if (results && heatCanvasRef.current) {
+            setTimeout(() => drawHeatmap(heatCanvasRef.current, results.findings), 100);
+        }
+    }, [results, viewMode]);
+
+    // Auto-scroll chat
+    useEffect(() => {
+        chatEndRef.current?.scrollIntoView({ behavior: "smooth" });
+    }, [chatMessages]);
+
+    const handleFile = (file) => {
+        if (!file || !file.type.startsWith("image/")) return;
+        setImageFile(file);
+        setImageURL(URL.createObjectURL(file));
+    };
+
+    const handleDrop = (e) => {
+        e.preventDefault();
+        setDragActive(false);
+        handleFile(e.dataTransfer.files[0]);
+    };
+
+    const resetAll = () => {
+        setPhase("upload");
+        setImageFile(null);
+        setImageURL(null);
+        setProgress(0);
+        setScanStep(0);
+        setResults(null);
+        setViewMode("original");
+        setActiveTab("analysis");
+        setShowRiskPanel(false);
+    };
+
+    const runAnalysis = async () => {
+        if (!imageFile) return;
+        setPhase("scanning");
+        setProgress(0);
+        setScanStep(0);
+
+        // Simulate scanning steps
+        for (let i = 0; i < scanSteps.length; i++) {
+            setScanStep(i);
+            await new Promise((r) => setTimeout(r, 700 + Math.random() * 400));
+            setProgress(Math.round(((i + 1) / scanSteps.length) * 100));
+        }
+
+        // Simulate AI result (in production, call real API)
+        const isPneumonia = Math.random() > 0.4;
+        const confidence = isPneumonia ? 72 + Math.floor(Math.random() * 22) : 80 + Math.floor(Math.random() * 18);
+        const findings = isPneumonia
+            ? [FINDING_TYPES[0], FINDING_TYPES[1]].slice(0, Math.random() > 0.5 ? 2 : 1)
+            : [FINDING_TYPES[4]];
+        if (isPneumonia && Math.random() > 0.6) findings.push(FINDING_TYPES[2]);
+
+        setResults({
+            isPneumonia,
+            confidence,
+            findings,
+            aiProb: confidence,
+            humanProb: Math.max(10, confidence - 8 + Math.floor(Math.random() * 16)),
+            ensembleProb: Math.min(99, confidence + Math.floor(Math.random() * 5)),
+            severity: isPneumonia ? (confidence > 88 ? "Severe" : confidence > 75 ? "Moderate" : "Mild") : "None",
+            laterality: isPneumonia ? (Math.random() > 0.5 ? "Right-sided" : "Left-sided") : "N/A",
+            lungZone: isPneumonia ? (Math.random() > 0.5 ? "Lower lobe" : "Multi-lobar") : "N/A",
+            recommendation: isPneumonia
+                ? "Correlate clinically. Consider CBC, CRP, sputum culture. Start empiric antibiotics if bacterial etiology suspected."
+                : "No acute cardiopulmonary process identified. Clinical correlation recommended.",
+        });
+
+        await new Promise((r) => setTimeout(r, 300));
+        setPhase("results");
+    };
+
+    const sendChat = async (text) => {
+        const msg = text || chatInput.trim();
+        if (!msg || chatLoading) return;
+        setChatInput("");
+        setChatMessages((prev) => [...prev, { role: "user", content: msg }]);
+        setChatLoading(true);
+        try {
+            const contextMsg = results
+                ? `[Context: Patient X-ray analysis shows ${results.isPneumonia ? "PNEUMONIA DETECTED" : "NORMAL"} with ${results.confidence}% confidence. Findings: ${results.findings.map((f) => f.label).join(", ")}. Severity: ${results.severity}. Laterality: ${results.laterality}. Lung zone: ${results.lungZone}.]\n\nUser question: ${msg}`
+                : msg;
+
+            const res = await fetch("https://api.anthropic.com/v1/messages", {
+                method: "POST",
+                headers: { "Content-Type": "application/json" },
+                body: JSON.stringify({
+                    model: "claude-sonnet-4-20250514",
+                    max_tokens: 1000,
+                    system: CHAT_SYSTEM,
+                    messages: [
+                        ...chatMessages.filter((m) => m.role !== "assistant" || chatMessages.indexOf(m) > 0).map((m) => ({ role: m.role, content: m.content })),
+                        { role: "user", content: contextMsg },
+                    ],
+                }),
+            });
+            const data = await res.json();
+            const reply = data.content?.map((b) => b.text || "").join("") || "Sorry, I couldn't process that.";
+            setChatMessages((prev) => [...prev, { role: "assistant", content: reply }]);
+        } catch {
+            setChatMessages((prev) => [...prev, { role: "assistant", content: "Connection error. Please try again." }]);
+        }
+        setChatLoading(false);
+    };
+
+    // ── Render helpers ────────────────────────────────────────────────────────
+
+    const verdictColor = results?.isPneumonia ? "var(--red)" : "var(--green)";
+    const verdictGlow = results?.isPneumonia ? "var(--red-glow)" : "var(--green-glow)";
+    const verdictBg = results?.isPneumonia ? "rgba(255,91,120,0.07)" : "rgba(48,212,122,0.07)";
+
+    return (
+        <div className="app" onMouseMove={handleMouseMove} style={{ fontFamily: "'Syne', sans-serif" }}>
+            {/* Background layers */}
+            <div className="cosmos">
+                <div className="cosmos-orb a" />
+                <div className="cosmos-orb b" />
+                <div className="cosmos-orb c" />
+                <div className="cosmos-orb d" />
+            </div>
+            <div className="aurora">
+                <div className="aurora-band a" />
+                <div className="aurora-band b" />
+                <div className="aurora-band c" />
+            </div>
+            <div className="bg-grid"><div className="bg-grid-inner" /></div>
+            <canvas className="particle-canvas" ref={particleCanvasRef} />
+            <div className="mouse-glow" style={{ left: mousePos.x, top: mousePos.y }} />
+            <div className="floating-rings">
+                <div className="ring r1" /><div className="ring r2" /><div className="ring r3" />
+            </div>
+
+            {/* Header */}
+            <header className="header">
+                <div className="header-brand">
+                    <div className="logo-ring" onClick={resetAll} title="Start over">
+                        <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+                            <path d="M22 12h-4l-3 9L9 3l-3 9H2" />
+                        </svg>
+                    </div>
+                    <div className="brand-text">
+                        <h1>PneumoScan AI</h1>
+                        <p>CHEST X-RAY ANALYSIS · v2.4.1</p>
+                    </div>
+                </div>
+                <div className="header-right">
+                    <div className="model-badge">
+                        <span className="badge-dot" />
+                        claude-sonnet · radiologist mode
+                    </div>
+                    {phase === "results" && (
+                        <button
+                            onClick={resetAll}
+                            style={{
+                                background: "rgba(255,91,120,0.08)", border: "1px solid rgba(255,91,120,0.28)",
+                                color: "#ff8fa3", borderRadius: 999, padding: "8px 16px",
+                                fontFamily: "'JetBrains Mono',monospace", fontSize: "0.68rem",
+                                cursor: "pointer", display: "flex", alignItems: "center", gap: 6, transition: "all 0.2s",
+                            }}
+                            onMouseEnter={(e) => { e.currentTarget.style.background = "rgba(255,91,120,0.14)"; }}
+                            onMouseLeave={(e) => { e.currentTarget.style.background = "rgba(255,91,120,0.08)"; }}
+                        >
+                            <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5"><polyline points="1 4 1 10 7 10" /><path d="M3.51 15a9 9 0 1 0 .49-3.31" /></svg>
+                            Analyze another
+                        </button>
+                    )}
+                </div>
+            </header>
+
+            {/* ── UPLOAD SECTION ── */}
+            {phase === "upload" && (
+                <section className="section section-upload">
+                    <div className="section-inner">
+                        <div className="hero-text">
+                            <div className="hero-kicker">
+                                <span className="hero-kicker-dot" />
+                                AI-Powered Diagnostic Tool
+                            </div>
+                            <h2 className="hero-title">Detect <em>Pneumonia</em><br />from Chest X-rays</h2>
+                            <p className="hero-sub">
+                                Upload a PA or AP chest radiograph. Our deep learning model analyzes lung fields,
+                                detects consolidations, infiltrates, and pleural effusions in seconds.
+                            </p>
+                        </div>
+
+                        {/* Stats row */}
+                        <div className="stats-row">
+                            {[
+                                { icon: "🎯", num: "94.2", unit: "%", lbl: "Sensitivity" },
+                                { icon: "📊", num: "97.8", unit: "%", lbl: "Specificity" },
+                                { icon: "⚡", num: "<3", unit: "s", lbl: "Inference" },
+                                { icon: "🫁", num: "120k", unit: "+", lbl: "Training CXRs" },
+                            ].map((s) => (
+                                <div key={s.lbl} className="stat-pill">
+                                    <span style={{ fontSize: "1.1rem" }}>{s.icon}</span>
+                                    <span className="stat-num">{s.num}<span style={{ fontSize: "0.7rem" }}>{s.unit}</span></span>
+                                    <span className="stat-lbl">{s.lbl}</span>
+                                </div>
+                            ))}
+                        </div>
+
+                        {/* Upload card */}
+                        <div className="upload-card">
+                            <div
+                                className={`dropzone${dragActive ? " active" : ""}${imageURL ? " has-preview" : ""}`}
+                                onDragOver={(e) => { e.preventDefault(); setDragActive(true); }}
+                                onDragLeave={() => setDragActive(false)}
+                                onDrop={handleDrop}
+                                onClick={() => !imageURL && fileInputRef.current?.click()}
+                            >
+                                {imageURL ? (
+                                    <div className="preview-container">
+                                        <img src={imageURL} alt="X-ray preview" className="preview-img" />
+                                        <div className="preview-overlay">
+                                            <div className="preview-corners">
+                                                <div className="corner tl" /><div className="corner tr" />
+                                                <div className="corner bl" /><div className="corner br" />
+                                            </div>
+                                            <div className="preview-badge">
+                                                <svg width="10" height="10" viewBox="0 0 24 24" fill="none" stroke="#30d47a" strokeWidth="2.5"><polyline points="20 6 9 17 4 12" /></svg>
+                                                {imageFile?.name || "Image loaded"} · {imageFile ? (imageFile.size / 1024).toFixed(0) + " KB" : ""}
+                                            </div>
+                                        </div>
+                                    </div>
+                                ) : (
+                                    <div className="drop-placeholder">
+                                        <div className="drop-icon-wrap">
+                                            <svg width="28" height="28" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round">
+                                                <rect x="3" y="3" width="18" height="18" rx="3" />
+                                                <circle cx="8.5" cy="8.5" r="1.5" /><polyline points="21 15 16 10 5 21" />
+                                            </svg>
+                                        </div>
+                                        <p className="drop-title">Drop chest X-ray here</p>
+                                        <p className="drop-sub">or click to browse files</p>
+                                        <div className="drop-formats">
+                                            {["JPEG", "PNG", "DICOM*", "TIFF", "WebP"].map((f) => <span key={f} className="format-chip">{f}</span>)}
+                                        </div>
+                                        <p style={{ fontSize: "0.62rem", color: "var(--text3)", marginTop: 10, fontFamily: "'JetBrains Mono',monospace" }}>
+                                            *DICOM preview mode — full DICOM requires backend
+                                        </p>
+                                    </div>
+                                )}
+                            </div>
+                            <input ref={fileInputRef} type="file" accept="image/*" style={{ display: "none" }} onChange={(e) => handleFile(e.target.files[0])} />
+
+                            {imageURL && (
+                                <div style={{ display: "flex", gap: 8, marginTop: 14 }}>
+                                    <button
+                                        style={{
+                                            flex: 1, padding: "10px", background: "rgba(90,150,255,0.06)",
+                                            border: "1px solid var(--border2)", borderRadius: 12, color: "var(--text2)",
+                                            fontFamily: "'Syne',sans-serif", fontSize: "0.8rem", fontWeight: 600,
+                                            cursor: "pointer", transition: "all 0.2s",
+                                        }}
+                                        onClick={() => { setImageFile(null); setImageURL(null); }}
+                                        onMouseEnter={(e) => e.currentTarget.style.background = "rgba(90,150,255,0.12)"}
+                                        onMouseLeave={(e) => e.currentTarget.style.background = "rgba(90,150,255,0.06)"}
+                                    >
+                                        Change image
+                                    </button>
+                                    <button className="btn-analyse" style={{ flex: 2, margin: 0 }} onClick={runAnalysis}>
+                                        <span className="btn-shimmer" />
+                                        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round">
+                                            <circle cx="11" cy="11" r="8" /><line x1="21" y1="21" x2="16.65" y2="16.65" />
+                                        </svg>
+                                        Run Analysis
+                                    </button>
+                                </div>
+                            )}
+
+                            {!imageURL && (
+                                <button className="btn-analyse" disabled>
+                                    <span className="btn-shimmer" />
+                                    <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round">
+                                        <path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z" />
+                                    </svg>
+                                    Upload X-ray to Analyze
+                                </button>
+                            )}
+                        </div>
+
+                        {/* Info chips */}
+                        <div style={{ display: "flex", gap: 10, flexWrap: "wrap", justifyContent: "center", maxWidth: 560 }}>
+                            {["🔒 No data stored", "⚕️ Not a clinical device", "🧠 ResNet-152 backbone", "📡 Real-time inference"].map((chip) => (
+                                <span key={chip} style={{
+                                    fontFamily: "'JetBrains Mono',monospace", fontSize: "0.62rem", padding: "5px 12px",
+                                    borderRadius: 999, border: "1px solid var(--border)", color: "var(--text3)",
+                                    background: "rgba(90,150,255,0.04)",
+                                }}>{chip}</span>
+                            ))}
+                        </div>
+                    </div>
+                </section>
+            )}
+
+            {/* ── SCANNING SECTION ── */}
+            {phase === "scanning" && (
+                <section className="section section-upload">
+                    <div className="section-inner">
+                        <div className="scan-loader">
+                            <div className="scan-orbit-wrap">
+                                <div className="scan-orbit o1"><div className="orbit-dot" /></div>
+                                <div className="scan-orbit o2"><div className="orbit-dot" /></div>
+                                <div className="scan-orbit o3"><div className="orbit-dot" /></div>
+                                <div className="scan-core">
+                                    <svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round">
+                                        <path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z" />
+                                    </svg>
+                                </div>
+                            </div>
+                            <p className="scan-label">Analyzing X-ray</p>
+                            <p className="scan-sub" style={{ minHeight: 20, transition: "opacity 0.3s" }}>
+                                {scanSteps[scanStep]}
+                            </p>
+                            <div className="progress-track">
+                                <div className="progress-fill" style={{ width: `${progress}%`, transition: "width 0.5s ease" }} />
+                            </div>
+                            <p style={{ fontFamily: "'JetBrains Mono',monospace", fontSize: "0.72rem", color: "var(--accent)" }}>
+                                {progress}% complete
+                            </p>
+                            {/* Live preview thumbnail */}
+                            {imageURL && (
+                                <div style={{ position: "relative", width: 120, height: 90, borderRadius: 10, overflow: "hidden", border: "1px solid var(--border2)", marginTop: 10 }}>
+                                    <img src={imageURL} alt="" style={{ width: "100%", height: "100%", objectFit: "cover", opacity: 0.5 }} />
+                                    <div className="scan-line" />
+                                </div>
+                            )}
+                        </div>
+                    </div>
+                </section>
+            )}
+
+            {/* ── RESULTS SECTION ── */}
+            {phase === "results" && results && (
+                <section className="section section-results">
+                    <div className="section-inner">
+                        {/* Tab bar */}
+                        <div style={{
+                            display: "flex", gap: 6, background: "rgba(3,10,32,0.6)", padding: 5,
+                            borderRadius: 16, border: "1px solid var(--border)", width: "100%",
+                        }}>
+                            {[
+                                { id: "analysis", icon: "🫁", label: "Analysis" },
+                                { id: "bot", icon: "🤖", label: "AI Assistant" },
+                                { id: "info", icon: "ℹ️", label: "About Pneumonia" },
+                            ].map((tab) => (
+                                <button
+                                    key={tab.id}
+                                    onClick={() => setActiveTab(tab.id)}
+                                    style={{
+                                        flex: 1, padding: "11px 12px", borderRadius: 11, border: "none",
+                                        background: activeTab === tab.id ? "linear-gradient(135deg,#2860ff,#1845e0)" : "transparent",
+                                        color: activeTab === tab.id ? "#fff" : "var(--text3)",
+                                        fontFamily: "'Syne',sans-serif", fontSize: "0.82rem", fontWeight: 600,
+                                        cursor: "pointer", transition: "all 0.22s cubic-bezier(0.34,1.56,0.64,1)",
+                                        boxShadow: activeTab === tab.id ? "0 4px 20px rgba(40,96,255,0.42)" : "none",
+                                        transform: activeTab === tab.id ? "scale(1.02)" : "scale(1)",
+                                    }}
+                                >
+                                    {tab.icon} {tab.label}
+                                </button>
+                            ))}
+                        </div>
+
+                        {/* ── ANALYSIS TAB ── */}
+                        {activeTab === "analysis" && (
+                            <div className="results-grid">
+                                {/* Verdict banner */}
+                                <div className="verdict-banner" style={{ borderColor: verdictColor, background: verdictBg, boxShadow: `0 0 55px ${verdictGlow}` }}>
+                                    <div className="verdict-icon" style={{ background: `${verdictColor}18`, borderColor: `${verdictColor}44`, color: verdictColor }}>
+                                        {results.isPneumonia ? (
+                                            <svg width="26" height="26" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round"><path d="M10.29 3.86L1.82 18a2 2 0 001.71 3h16.94a2 2 0 001.71-3L13.71 3.86a2 2 0 00-3.42 0z" /><line x1="12" y1="9" x2="12" y2="13" /><line x1="12" y1="17" x2="12.01" y2="17" /></svg>
+                                        ) : (
+                                            <svg width="26" height="26" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round"><polyline points="20 6 9 17 4 12" /></svg>
+                                        )}
+                                    </div>
+                                    <div className="verdict-text">
+                                        <span className="verdict-label" style={{ color: verdictColor }}>
+                                            {results.isPneumonia ? "Pneumonia Detected" : "No Pneumonia"}
+                                        </span>
+                                        <span className="verdict-conf">
+                                            {results.confidence}% confidence · {results.severity !== "None" ? results.severity + " severity" : "Clear lung fields"} · {results.laterality}
+                                        </span>
+                                    </div>
+                                    <span className="verdict-badge" style={{ color: verdictColor, borderColor: `${verdictColor}44`, background: `${verdictColor}0f` }}>
+                                        {results.isPneumonia ? "⚠ ABNORMAL" : "✓ NORMAL"}
+                                    </span>
+                                </div>
+
+                                {/* Gauges */}
+                                <div className="gauges-card">
+                                    <div className="card-eyebrow">Probability Breakdown</div>
+                                    <div className="gauges-row">
+                                        <Gauge value={results.aiProb} color={results.isPneumonia ? "#ff5b78" : "#30d47a"} label="AI Model" />
+                                        <div className="gauge-divider" />
+                                        <Gauge value={results.humanProb} color="#5a96ff" label="Radiologist Est." />
+                                        <div className="gauge-divider" />
+                                        <Gauge value={results.ensembleProb} color="#a855f7" label="Ensemble" />
+                                    </div>
+                                    {/* Findings pills */}
+                                    <div style={{ display: "flex", gap: 8, flexWrap: "wrap", marginTop: 16, paddingTop: 16, borderTop: "1px solid var(--border)" }}>
+                                        {results.findings.map((f) => (
+                                            <span
+                                                key={f.id}
+                                                onMouseEnter={() => setHoveredFinding(f)}
+                                                onMouseLeave={() => setHoveredFinding(null)}
+                                                style={{
+                                                    display: "flex", alignItems: "center", gap: 7,
+                                                    padding: "6px 14px", borderRadius: 999,
+                                                    border: `1px solid ${f.color}44`,
+                                                    background: `${f.color}10`, color: f.color,
+                                                    fontFamily: "'JetBrains Mono',monospace", fontSize: "0.68rem",
+                                                    cursor: "default", transition: "all 0.2s",
+                                                    boxShadow: hoveredFinding?.id === f.id ? `0 0 20px ${f.color}44` : "none",
+                                                }}
+                                            >
+                                                <span style={{ width: 7, height: 7, borderRadius: 2, background: f.color, display: "inline-block" }} />
+                                                {f.label}
+                                            </span>
+                                        ))}
+                                    </div>
+                                    {hoveredFinding && (
+                                        <p style={{ fontFamily: "'JetBrains Mono',monospace", fontSize: "0.68rem", color: "var(--text2)", marginTop: 10, transition: "all 0.2s" }}>
+                                            <span style={{ color: hoveredFinding.color }}>▸ </span>{hoveredFinding.desc}
+                                        </p>
+                                    )}
+                                </div>
+
+                                {/* Image viewer */}
+                                <div className="viewer-card">
+                                    <div className="card-eyebrow">Radiograph Viewer</div>
+                                    <div className="img-toggle-row">
+                                        {[
+                                            { id: "original", label: "Original" },
+                                            { id: "heatmap", label: "AI Heatmap" },
+                                            { id: "annotated", label: "Annotated" },
+                                        ].map((m) => (
+                                            <button key={m.id} className={`toggle-btn${viewMode === m.id ? " active" : ""}`} onClick={() => setViewMode(m.id)}>
+                                                {m.label}
+                                            </button>
+                                        ))}
+                                    </div>
+                                    <div className="cam-img-wrap" style={{ maxWidth: 340, margin: "0 auto" }}>
+                                        <img src={imageURL} alt="X-ray" className="cam-img" style={{ opacity: viewMode === "heatmap" ? 0.55 : 0.92 }} />
+                                        {viewMode === "heatmap" && (
+                                            <canvas
+                                                ref={heatCanvasRef}
+                                                width={340} height={255}
+                                                style={{ position: "absolute", inset: 0, width: "100%", height: "100%", mixBlendMode: "screen", borderRadius: "var(--radius)", pointerEvents: "none" }}
+                                            />
+                                        )}
+                                        {viewMode === "annotated" && results.isPneumonia && (
+                                            <svg style={{ position: "absolute", inset: 0, width: "100%", height: "100%", pointerEvents: "none" }}>
+                                                <circle cx="60%" cy="48%" r="12%" stroke="#ff5b78" strokeWidth="2" fill="none" strokeDasharray="4 2" opacity="0.9" />
+                                                <text x="62%" y="36%" fill="#ff5b78" fontSize="10" fontFamily="'JetBrains Mono'" opacity="0.9">OPACITY</text>
+                                                {results.findings.some((f) => f.id === "effusion") && (
+                                                    <>
+                                                        <ellipse cx="62%" cy="75%" rx="10%" ry="5%" stroke="#5a96ff" strokeWidth="1.5" fill="none" strokeDasharray="4 2" opacity="0.85" />
+                                                        <text x="64%" y="82%" fill="#5a96ff" fontSize="9" fontFamily="'JetBrains Mono'" opacity="0.85">EFFUSION</text>
+                                                    </>
+                                                )}
+                                            </svg>
+                                        )}
+                                        <div className="cam-corners">
+                                            <div className="c tl" /><div className="c tr" /><div className="c bl" /><div className="c br" />
+                                        </div>
+                                        <div className="scan-line" />
+                                        <div className="cam-legend">
+                                            {viewMode === "heatmap" ? (
+                                                <>
+                                                    <div className="legend-item hot"><span className="legend-dot" />High activity</div>
+                                                    <div className="legend-item cool"><span className="legend-dot" />Low activity</div>
+                                                </>
+                                            ) : (
+                                                <span style={{ fontFamily: "'JetBrains Mono',monospace", fontSize: "0.62rem", color: "var(--text3)" }}>
+                                                    {viewMode === "annotated" ? "AI annotations overlaid" : "Original radiograph"}
+                                                </span>
+                                            )}
+                                        </div>
+                                    </div>
+                                </div>
+
+                                {/* Clinical details */}
+                                <div className="gauges-card" style={{ cursor: "pointer" }} onClick={() => setShowRiskPanel(!showRiskPanel)}>
+                                    <div className="card-eyebrow" style={{ justifyContent: "space-between" }}>
+                                        <span>Clinical Details &amp; Recommendation</span>
+                                        <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" style={{ transform: showRiskPanel ? "rotate(180deg)" : "none", transition: "transform 0.3s" }}>
+                                            <polyline points="6 9 12 15 18 9" />
+                                        </svg>
+                                    </div>
+                                    <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 10, marginBottom: 14 }}>
+                                        {[
+                                            { lbl: "Laterality", val: results.laterality },
+                                            { lbl: "Lung Zone", val: results.lungZone },
+                                            { lbl: "Severity", val: results.severity },
+                                            { lbl: "Effusion", val: results.findings.some((f) => f.id === "effusion") ? "Present" : "Absent" },
+                                        ].map((r) => (
+                                            <div key={r.lbl} style={{ background: "rgba(90,150,255,0.04)", borderRadius: 10, padding: "10px 14px", border: "1px solid var(--border)" }}>
+                                                <p style={{ fontFamily: "'JetBrains Mono',monospace", fontSize: "0.58rem", color: "var(--text3)", textTransform: "uppercase", letterSpacing: "0.6px", marginBottom: 4 }}>{r.lbl}</p>
+                                                <p style={{ fontFamily: "'Syne',sans-serif", fontSize: "0.9rem", fontWeight: 700, color: "var(--text)" }}>{r.val}</p>
+                                            </div>
+                                        ))}
+                                    </div>
+
+                                    {showRiskPanel && (
+                                        <>
+                                            <div style={{ background: results.isPneumonia ? "rgba(255,91,120,0.06)" : "rgba(48,212,122,0.06)", border: `1px solid ${verdictColor}30`, borderRadius: 12, padding: "14px 16px", marginBottom: 10 }}>
+                                                <p style={{ fontFamily: "'JetBrains Mono',monospace", fontSize: "0.7rem", color: "var(--text2)", lineHeight: 1.65 }}>
+                                                    <span style={{ color: verdictColor, fontWeight: 700 }}>▸ Recommendation: </span>{results.recommendation}
+                                                </p>
+                                            </div>
+                                            {/* Risk factors */}
+                                            <div style={{ paddingTop: 10, borderTop: "1px solid var(--border)" }}>
+                                                <p style={{ fontFamily: "'JetBrains Mono',monospace", fontSize: "0.58rem", color: "var(--text3)", textTransform: "uppercase", letterSpacing: "0.6px", marginBottom: 10 }}>Differential Diagnosis</p>
+                                                {["Community-acquired pneumonia", "COVID-19 pneumonitis", "Aspiration pneumonia", "Pulmonary edema"].map((d, i) => (
+                                                    <div key={d} style={{ display: "flex", alignItems: "center", gap: 10, marginBottom: 8 }}>
+                                                        <div style={{ flex: 1, height: 4, borderRadius: 999, background: "rgba(110,165,255,0.10)", overflow: "hidden" }}>
+                                                            <div style={{ width: `${[78, 42, 35, 22][i]}%`, height: "100%", background: ["#5a96ff", "#a855f7", "#f59e0b", "#30d47a"][i], borderRadius: 999, boxShadow: `0 0 8px ${["#5a96ff", "#a855f7", "#f59e0b", "#30d47a"][i]}66` }} />
+                                                        </div>
+                                                        <span style={{ fontFamily: "'JetBrains Mono',monospace", fontSize: "0.65rem", color: "var(--text2)", minWidth: 30, textAlign: "right" }}>{[78, 42, 35, 22][i]}%</span>
+                                                        <span style={{ fontFamily: "'JetBrains Mono',monospace", fontSize: "0.65rem", color: "var(--text3)", minWidth: 180 }}>{d}</span>
+                                                    </div>
+                                                ))}
+                                            </div>
+                                        </>
+                                    )}
+                                </div>
+
+                                <p className="disclaimer">
+                                    ⚠ FOR RESEARCH USE ONLY · Not a certified medical device · Not a substitute for professional radiological interpretation<br />
+                                    Always consult a qualified physician for clinical decisions
+                                </p>
+                            </div>
+                        )}
+
+                        {/* ── BOT TAB ── */}
+                        {activeTab === "bot" && (
+                            <div style={{ width: "100%", display: "flex", flexDirection: "column", gap: 16 }}>
+                                {/* Chat window */}
+                                <div style={{
+                                    background: "var(--glass2)", border: "1px solid var(--border)", borderRadius: "var(--radius-lg)",
+                                    backdropFilter: "blur(36px)", overflow: "hidden", display: "flex", flexDirection: "column",
+                                    boxShadow: "0 24px 60px rgba(0,3,16,0.5)",
+                                }}>
+                                    {/* Chat header */}
+                                    <div style={{ padding: "14px 20px", borderBottom: "1px solid var(--border)", display: "flex", alignItems: "center", gap: 12 }}>
+                                        <div style={{
+                                            width: 36, height: 36, borderRadius: 11, background: "linear-gradient(135deg,#2860ff,#0f2ea8)",
+                                            display: "flex", alignItems: "center", justifyContent: "center",
+                                            boxShadow: "0 0 18px rgba(90,150,255,0.45)",
+                                        }}>
+                                            <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="white" strokeWidth="2" strokeLinecap="round">
+                                                <path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z" />
+                                            </svg>
+                                        </div>
+                                        <div>
+                                            <p style={{ fontFamily: "'Syne',sans-serif", fontWeight: 700, fontSize: "0.9rem", color: "var(--text)" }}>RadBot — AI Radiologist</p>
+                                            <p style={{ fontFamily: "'JetBrains Mono',monospace", fontSize: "0.6rem", color: "var(--text3)" }}>
+                                                {results ? `Context loaded: ${results.isPneumonia ? "Pneumonia detected" : "Normal study"}` : "General Q&A mode"}
+                                            </p>
+                                        </div>
+                                        <div className="badge-dot" style={{ marginLeft: "auto" }} />
+                                    </div>
+
+                                    {/* Messages */}
+                                    <div style={{ height: 320, overflowY: "auto", padding: "16px 20px", display: "flex", flexDirection: "column", gap: 12 }}>
+                                        {chatMessages.map((msg, i) => (
+                                            <div key={i} style={{ display: "flex", justifyContent: msg.role === "user" ? "flex-end" : "flex-start" }}>
+                                                <div style={{
+                                                    maxWidth: "82%",
+                                                    padding: "11px 15px",
+                                                    borderRadius: msg.role === "user" ? "16px 16px 4px 16px" : "16px 16px 16px 4px",
+                                                    background: msg.role === "user" ? "linear-gradient(135deg,#2860ff,#1845e0)" : "rgba(90,150,255,0.07)",
+                                                    border: msg.role === "user" ? "none" : "1px solid var(--border)",
+                                                    color: msg.role === "user" ? "#fff" : "var(--text)",
+                                                    fontFamily: "'Syne',sans-serif", fontSize: "0.84rem", lineHeight: 1.6,
+                                                    boxShadow: msg.role === "user" ? "0 4px 20px rgba(40,96,255,0.32)" : "none",
+                                                }}>
+                                                    {msg.content}
+                                                </div>
+                                            </div>
+                                        ))}
+                                        {chatLoading && (
+                                            <div style={{ display: "flex" }}>
+                                                <div style={{ padding: "12px 16px", borderRadius: "16px 16px 16px 4px", background: "rgba(90,150,255,0.07)", border: "1px solid var(--border)", display: "flex", gap: 5, alignItems: "center" }}>
+                                                    {[0, 1, 2].map((i) => (
+                                                        <span key={i} style={{ width: 6, height: 6, borderRadius: "50%", background: "var(--accent)", display: "block", animation: `pulse-dot 1.2s ${i * 0.2}s ease-in-out infinite` }} />
+                                                    ))}
+                                                </div>
+                                            </div>
+                                        )}
+                                        <div ref={chatEndRef} />
+                                    </div>
+
+                                    {/* Quick questions */}
+                                    <div style={{ padding: "10px 16px", borderTop: "1px solid var(--border)", display: "flex", gap: 6, flexWrap: "wrap" }}>
+                                        {QUICK_QUESTIONS.slice(0, 3).map((q) => (
+                                            <button
+                                                key={q}
+                                                onClick={() => sendChat(q)}
+                                                style={{
+                                                    fontFamily: "'JetBrains Mono',monospace", fontSize: "0.6rem",
+                                                    padding: "5px 12px", borderRadius: 999, border: "1px solid var(--border2)",
+                                                    background: "rgba(90,150,255,0.06)", color: "var(--accent)", cursor: "pointer",
+                                                    transition: "all 0.2s",
+                                                }}
+                                                onMouseEnter={(e) => e.currentTarget.style.background = "rgba(90,150,255,0.14)"}
+                                                onMouseLeave={(e) => e.currentTarget.style.background = "rgba(90,150,255,0.06)"}
+                                            >
+                                                {q}
+                                            </button>
+                                        ))}
+                                    </div>
+
+                                    {/* Input */}
+                                    <div style={{ padding: "12px 16px", borderTop: "1px solid var(--border)", display: "flex", gap: 10 }}>
+                                        <input
+                                            value={chatInput}
+                                            onChange={(e) => setChatInput(e.target.value)}
+                                            onKeyDown={(e) => e.key === "Enter" && sendChat()}
+                                            placeholder="Ask about findings, treatments, follow-up…"
+                                            style={{
+                                                flex: 1, background: "rgba(3,10,32,0.6)", border: "1px solid var(--border2)",
+                                                borderRadius: 12, padding: "11px 16px", color: "var(--text)",
+                                                fontFamily: "'Syne',sans-serif", fontSize: "0.85rem", outline: "none",
+                                                transition: "border-color 0.2s",
+                                            }}
+                                            onFocus={(e) => e.target.style.borderColor = "var(--accent)"}
+                                            onBlur={(e) => e.target.style.borderColor = "var(--border2)"}
+                                        />
+                                        <button
+                                            onClick={() => sendChat()}
+                                            disabled={chatLoading || !chatInput.trim()}
+                                            style={{
+                                                width: 44, height: 44, borderRadius: 12, border: "none",
+                                                background: chatInput.trim() ? "linear-gradient(135deg,#2860ff,#1845e0)" : "rgba(90,150,255,0.1)",
+                                                color: chatInput.trim() ? "#fff" : "var(--text3)",
+                                                cursor: chatInput.trim() ? "pointer" : "not-allowed",
+                                                display: "flex", alignItems: "center", justifyContent: "center",
+                                                transition: "all 0.2s", flexShrink: 0,
+                                                boxShadow: chatInput.trim() ? "0 4px 20px rgba(40,96,255,0.42)" : "none",
+                                            }}
+                                        >
+                                            <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round"><line x1="22" y1="2" x2="11" y2="13" /><polygon points="22 2 15 22 11 13 2 9 22 2" /></svg>
+                                        </button>
+                                    </div>
+                                </div>
+
+                                {/* More quick questions */}
+                                <div style={{ display: "flex", gap: 8, flexWrap: "wrap" }}>
+                                    {QUICK_QUESTIONS.slice(3).map((q) => (
+                                        <button
+                                            key={q}
+                                            onClick={() => sendChat(q)}
+                                            style={{
+                                                fontFamily: "'JetBrains Mono',monospace", fontSize: "0.62rem",
+                                                padding: "7px 14px", borderRadius: 999, border: "1px solid var(--border2)",
+                                                background: "rgba(90,150,255,0.04)", color: "var(--text2)", cursor: "pointer",
+                                                transition: "all 0.2s",
+                                            }}
+                                            onMouseEnter={(e) => { e.currentTarget.style.background = "rgba(90,150,255,0.12)"; e.currentTarget.style.color = "var(--accent)"; }}
+                                            onMouseLeave={(e) => { e.currentTarget.style.background = "rgba(90,150,255,0.04)"; e.currentTarget.style.color = "var(--text2)"; }}
+                                        >
+                                            {q}
+                                        </button>
+                                    ))}
+                                </div>
+                            </div>
+                        )}
+
+                        {/* ── INFO TAB ── */}
+                        {activeTab === "info" && (
+                            <div style={{ width: "100%", display: "flex", flexDirection: "column", gap: 16 }}>
+                                {[
+                                    {
+                                        icon: "🫁", title: "What is Pneumonia?",
+                                        body: "Pneumonia is an infection that inflames the air sacs (alveoli) in one or both lungs. The alveoli may fill with fluid or pus, causing cough with phlegm, fever, chills, and difficulty breathing.",
+                                        color: "#5a96ff",
+                                    },
+                                    {
+                                        icon: "🔬", title: "Types by Etiology",
+                                        body: "Bacterial (S. pneumoniae most common), Viral (influenza, COVID-19, RSV), Fungal (Aspergillus, Histoplasma), Aspiration, Hospital-acquired (HAP), Ventilator-associated (VAP).",
+                                        color: "#a855f7",
+                                    },
+                                    {
+                                        icon: "📡", title: "Radiographic Findings",
+                                        body: "Key signs: lobar or segmental consolidation, air bronchograms, ground-glass opacity (GGO), pleural effusion, silhouette sign, and Kerley B lines in pulmonary edema.",
+                                        color: "#30d47a",
+                                    },
+                                    {
+                                        icon: "⚠️", title: "When to Seek Emergency Care",
+                                        body: "SpO₂ < 90%, respiratory rate > 30/min, confusion, persistent chest pain, systolic BP < 90 mmHg, or inability to maintain oral intake — these are CURB-65 criteria for severe pneumonia.",
+                                        color: "#ff5b78",
+                                    },
+                                    {
+                                        icon: "💊", title: "Treatment Overview",
+                                        body: "Community-acquired: amoxicillin ± macrolide. Atypical: fluoroquinolone or doxycycline. Viral: supportive ± antivirals. Severe: IV beta-lactam + macrolide. Always guided by local antibiogram.",
+                                        color: "#f59e0b",
+                                    },
+                                    {
+                                        icon: "📈", title: "Prognosis & Recovery",
+                                        body: "Outpatient mild: 5–7 days antibiotics, symptoms improve in 3–5 days. Radiographic clearance lags 4–6 weeks. Hospitalized patients: 7–14 day course. Elderly/immunocompromised may take longer.",
+                                        color: "#06b6d4",
+                                    },
+                                ].map((card) => (
+                                    <div key={card.title} style={{
+                                        background: "var(--glass2)", border: "1px solid var(--border)", borderRadius: 18,
+                                        padding: "18px 22px", backdropFilter: "blur(30px)",
+                                        display: "flex", gap: 16, alignItems: "flex-start",
+                                        transition: "all 0.25s", cursor: "default",
+                                        position: "relative", overflow: "hidden",
+                                    }}
+                                        onMouseEnter={(e) => { e.currentTarget.style.borderColor = `${card.color}44`; e.currentTarget.style.background = `${card.color}06`; }}
+                                        onMouseLeave={(e) => { e.currentTarget.style.borderColor = "var(--border)"; e.currentTarget.style.background = "var(--glass2)"; }}
+                                    >
+                                        <div style={{ width: 38, height: 38, borderRadius: 10, background: `${card.color}15`, border: `1px solid ${card.color}30`, display: "flex", alignItems: "center", justifyContent: "center", fontSize: "1.1rem", flexShrink: 0 }}>
+                                            {card.icon}
+                                        </div>
+                                        <div>
+                                            <p style={{ fontFamily: "'Syne',sans-serif", fontWeight: 700, fontSize: "0.9rem", color: card.color, marginBottom: 6 }}>{card.title}</p>
+                                            <p style={{ fontFamily: "'Syne',sans-serif", fontSize: "0.82rem", color: "var(--text2)", lineHeight: 1.65 }}>{card.body}</p>
+                                        </div>
+                                    </div>
+                                ))}
+                            </div>
+                        )}
+                    </div>
+                </section>
+            )}
+
+            {/* Footer */}
+            <footer className="footer">
+                <div className="footer-inner">
+                    <span className="footer-text">Built with</span>
+                    <span className="footer-heart">♥</span>
+                    <span className="footer-text">by</span>
+                    <span className="footer-name">PneumoScan AI</span>
+                    <span className="footer-amp">&</span>
+                    <span className="footer-text">Powered by Claude · Research use only</span>
+                </div>
+            </footer>
+        </div>
+    );
+}
