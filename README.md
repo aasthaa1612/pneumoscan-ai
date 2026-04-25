@@ -224,10 +224,4 @@ python backend/evaluate.py
 
 > This tool is intended for **research and educational purposes only**.
 > It is **not a substitute for professional clinical diagnosis**.
-> Always consult a licensed medical professional for health decisions.
-
----
-
-## 📄 License
-
-MIT © 2026 PneumoScan AI
+> Always consult a licensed medical professional for health decision.
