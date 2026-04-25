@@ -23,44 +23,64 @@ function ParticleCanvas() {
         const resize = () => { canvas.width = window.innerWidth; canvas.height = window.innerHeight; };
         resize();
         window.addEventListener("resize", resize);
-        const particles = Array.from({ length: 60 }, () => ({
-            x: Math.random() * window.innerWidth,
-            y: Math.random() * window.innerHeight,
-            r: Math.random() * 1.5 + 0.4,
-            vx: (Math.random() - 0.5) * 0.3,
-            vy: (Math.random() - 0.5) * 0.3,
-            alpha: Math.random() * 0.35 + 0.1,
-            pulse: Math.random() * Math.PI * 2,
-        }));
+        // Vibrant 4-colour palette
+        const COLORS = [
+            { r: 90,  g: 150, b: 255 }, // blue
+            { r: 167, g: 139, b: 250 }, // purple
+            { r: 244, g: 114, b: 182 }, // pink
+            { r: 52,  g: 211, b: 153 }, // teal
+        ];
+        const particles = Array.from({ length: 120 }, () => {
+            const c = COLORS[Math.floor(Math.random() * COLORS.length)];
+            return {
+                x: Math.random() * window.innerWidth,
+                y: Math.random() * window.innerHeight,
+                r: Math.random() * 2.5 + 1.0,
+                vx: (Math.random() - 0.5) * 0.55,
+                vy: (Math.random() - 0.5) * 0.55,
+                alpha: Math.random() * 0.5 + 0.25,
+                pulse: Math.random() * Math.PI * 2,
+                color: c,
+            };
+        });
         const draw = () => {
             ctx.clearRect(0, 0, canvas.width, canvas.height);
-            particles.forEach(p => { p.pulse += 0.018; });
+            particles.forEach(p => { p.pulse += 0.022; });
+            // Connections
             for (let i = 0; i < particles.length; i++) {
                 for (let j = i + 1; j < particles.length; j++) {
                     const dx = particles[i].x - particles[j].x;
                     const dy = particles[i].y - particles[j].y;
                     const dist = Math.sqrt(dx * dx + dy * dy);
-                    if (dist < 120) {
+                    if (dist < 160) {
+                        const opacity = 0.22 * (1 - dist / 160);
+                        const ci = particles[i].color;
                         ctx.beginPath();
-                        ctx.strokeStyle = `rgba(120,160,255,${0.10 * (1 - dist / 120)})`;
-                        ctx.lineWidth = 0.5;
+                        ctx.strokeStyle = `rgba(${ci.r},${ci.g},${ci.b},${opacity})`;
+                        ctx.lineWidth = 0.8;
                         ctx.moveTo(particles[i].x, particles[i].y);
                         ctx.lineTo(particles[j].x, particles[j].y);
                         ctx.stroke();
                     }
                 }
             }
+            // Dots
             particles.forEach(p => {
-                const pulsedAlpha = p.alpha * (0.7 + 0.3 * Math.sin(p.pulse));
+                const pa = p.alpha * (0.65 + 0.35 * Math.sin(p.pulse));
+                const { r: cr, g: cg, b: cb } = p.color;
+                // Outer glow
+                const grad = ctx.createRadialGradient(p.x, p.y, 0, p.x, p.y, p.r * 5);
+                grad.addColorStop(0,   `rgba(${cr},${cg},${cb},${pa})`);
+                grad.addColorStop(0.4, `rgba(${cr},${cg},${cb},${pa * 0.35})`);
+                grad.addColorStop(1,   `rgba(${cr},${cg},${cb},0)`);
+                ctx.beginPath(); ctx.fillStyle = grad;
+                ctx.arc(p.x, p.y, p.r * 5, 0, Math.PI * 2); ctx.fill();
+                // Solid core
                 ctx.beginPath();
-                const grad = ctx.createRadialGradient(p.x, p.y, 0, p.x, p.y, p.r * 3);
-                grad.addColorStop(0, `rgba(160,200,255,${pulsedAlpha})`);
-                grad.addColorStop(1, `rgba(79,142,255,0)`);
-                ctx.fillStyle = grad;
-                ctx.arc(p.x, p.y, p.r * 3, 0, Math.PI * 2);
-                ctx.fill();
+                ctx.fillStyle = `rgba(${cr},${cg},${cb},${Math.min(pa * 2, 1)})`;
+                ctx.arc(p.x, p.y, p.r, 0, Math.PI * 2); ctx.fill();
                 p.x += p.vx; p.y += p.vy;
-                if (p.x < 0 || p.x > canvas.width) p.vx *= -1;
+                if (p.x < 0 || p.x > canvas.width)  p.vx *= -1;
                 if (p.y < 0 || p.y > canvas.height) p.vy *= -1;
             });
             animId = requestAnimationFrame(draw);
@@ -268,7 +288,7 @@ function AIChatbot({ isOpen, onClose, result }) {
                         </div>
                         <div className="bot-header-text">
                             <span className="bot-name">PneumoScan AI</span>
-                            <span className="bot-subtitle">Medical Assistant · Powered by Claude</span>
+                            <span className="bot-subtitle">Medical Assistant · Powered by Groq</span>
                         </div>
                         <button className="bot-close" onClick={onClose}><X size={16} /></button>
                     </div>

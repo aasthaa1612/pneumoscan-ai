@@ -107,36 +107,48 @@ def predict():
 
 @app.route("/chat", methods=["POST"])
 def chat():
-    data = request.json
-    api_key = os.environ.get("ANTHROPIC_API_KEY", "sk-hQP9bcnrn4FgW1DOMCkJTg")
+    data    = request.json
+    api_key = os.environ.get("GROQ_API_KEY", "")
     if not api_key:
-        return jsonify({"content": [{"text": "I am currently in demo mode as no Anthropic API key is configured on the backend. Please set the ANTHROPIC_API_KEY environment variable to chat with me!"}]}), 200
-        
+        return jsonify({"content": [{"text": "⚠️ No Groq API key configured. Get a free key at https://console.groq.com and set the GROQ_API_KEY environment variable."}]}), 200
+
     try:
-        req_data = json.dumps({
-            "model": data.get("model", "claude-3-5-sonnet-20241022"),
-            "max_tokens": data.get("max_tokens", 1000),
-            "system": data.get("system", ""),
-            "messages": data.get("messages", [])
+        messages = data.get("messages", [])
+        system   = data.get("system", "")
+
+        # Build OpenAI-compatible messages list
+        groq_messages = []
+        if system:
+            groq_messages.append({"role": "system", "content": system})
+        for msg in messages:
+            groq_messages.append({"role": msg["role"], "content": msg["content"]})
+
+        body = json.dumps({
+            "model"      : "llama-3.1-8b-instant",
+            "messages"   : groq_messages,
+            "max_tokens" : data.get("max_tokens", 1000),
+            "temperature": 0.7,
         }).encode("utf-8")
-        
+
         req = urllib.request.Request(
-            "https://api.anthropic.com/v1/messages",
-            data=req_data,
+            "https://api.groq.com/openai/v1/chat/completions",
+            data=body,
             headers={
-                "x-api-key": "sk-hQP9bcnrn4FgW1DOMCkJTg",
-                "anthropic-version": "2023-06-01",
-                "content-type": "application/json"
+                "Authorization": f"Bearer {api_key}",
+                "content-type" : "application/json",
+                "User-Agent"   : "Mozilla/5.0 (compatible; PneumoScan/1.0)",
             },
             method="POST"
         )
-        
+
         with urllib.request.urlopen(req) as response:
             res_data = json.loads(response.read().decode("utf-8"))
-            return jsonify(res_data), response.status
+            text = res_data["choices"][0]["message"]["content"]
+            return jsonify({"content": [{"text": text}]}), 200
+
     except urllib.error.HTTPError as e:
         error_msg = e.read().decode("utf-8")
-        return jsonify({"error": f"API Error: {error_msg}"}), e.code
+        return jsonify({"error": f"Groq API Error: {error_msg}"}), 500
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
